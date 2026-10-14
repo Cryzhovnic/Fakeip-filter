@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download source lists
         shell: bash
@@ -71,6 +71,9 @@ jobs:
           if not merged:
               raise SystemExit("Merged list is empty")
 
+          # Сортировка (стабильные diff'ы)
+          merged.sort(key=str.lower)
+
           Path("work/fakeip-filter.list").write_text(
               "\n".join(merged) + "\n",
               encoding="utf-8",
@@ -78,17 +81,36 @@ jobs:
 
           print(f"Unique rules: {len(merged)}")
           PY
-
-      - name: Install latest Mihomo
+      
+      - name: Get latest Mihomo version
+        id: mihomo
         run: |
-          M_VER=$(curl $CURL_OPTS https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | \
-                  grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          set -euo pipefail
+          M_VER=$(curl $CURL_OPTS https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.tag_name | ltrimstr("v")')
+          echo "version=$M_VER" >> "$GITHUB_OUTPUT"
           echo "Latest mihomo version: $M_VER"
-          curl $CURL_OPTS -o mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v${M_VER}/mihomo-linux-amd64-v${M_VER}.gz
-          gunzip -f mihomo.gz
-          chmod +x mihomo
-          sudo mv mihomo /usr/local/bin/
+      
+      - name: Cache Mihomo binary
+        id: cache-mihomo
+        uses: actions/cache@v4
+        with:
+          path: work/mihomo
+          key: mihomo-linux-amd64-${{ steps.mihomo.outputs.version }}
+      
+      - name: Install Mihomo
+        run: |
+          set -euo pipefail
+          if [ ! -f work/mihomo ]; then
+            M_VER=${{ steps.mihomo.outputs.version }}
+            curl $CURL_OPTS -o mihomo.gz \
+              "https://github.com/MetaCubeX/mihomo/releases/download/v${M_VER}/mihomo-linux-amd64-v${M_VER}.gz"
+            gunzip -f mihomo.gz
+            mv mihomo work/mihomo
+          fi
+          chmod +x work/mihomo
+          sudo cp work/mihomo /usr/local/bin/mihomo
           mihomo -v
+          
 
       - name: Build and validate MRS
         shell: bash
@@ -118,6 +140,14 @@ jobs:
 
             if [ "$old_count" -gt 0 ] && [ "$new_count" -lt "$((old_count * 70 / 100))" ]; then
               echo "::error::Rule count dropped by more than 30%"
+              echo "=== Diff (removed / added) ==="
+              # показываем только различия
+              sort rules/fakeip-filter.list > /tmp/old.sorted
+              sort work/fakeip-filter.list  > /tmp/new.sorted
+              echo "--- Removed ---"
+              comm -23 /tmp/old.sorted /tmp/new.sorted | head -100
+              echo "--- Added ---"
+              comm -13 /tmp/old.sorted /tmp/new.sorted | head -100
               exit 1
             fi
           fi
@@ -145,14 +175,15 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Update fakeip-filter rules"
+          RULE_COUNT=$(wc -l < rules/fakeip-filter.list)
+          git commit -m "Update fakeip-filter rules (${RULE_COUNT} rules)"
           git push
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Create release
         if: steps.publish.outputs.changed == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: fakeip-${{ github.run_id }}
           name: fakeip-filter update ${{ github.run_number }}
