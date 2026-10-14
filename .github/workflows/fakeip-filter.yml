@@ -251,12 +251,20 @@ jobs:
           git push
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare release meta
+        id: meta
+        if: steps.publish.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          echo "tag=fakeip-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          echo "title=fakeip-filter $(date -u +'%Y-%m-%d %H:%M UTC') (${{ steps.merge.outputs.final }} rules)" >> "$GITHUB_OUTPUT"
+      
       - name: Create release
         if: steps.publish.outputs.changed == 'true'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: fakeip-${{ github.run_id }}-${{ github.run_attempt }}
-          name: fakeip-filter update ${{ github.run_number }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.title }}
           body: |
             Automated merge of fakeip-filter sources.
       
