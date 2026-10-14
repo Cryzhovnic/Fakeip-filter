@@ -80,33 +80,15 @@ jobs:
           PY
 
       - name: Install latest Mihomo
-        shell: bash
         run: |
-          set -euo pipefail
-
-          RELEASE=$(curl $CURL_OPTS \
-            https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)
-
-          URL=$(python3 -c '
-          import json, sys
-          release = json.loads(sys.argv[1])
-          assets = release["assets"]
-          matches = [
-              a["browser_download_url"] for a in assets
-              if "linux-amd64" in a["name"]
-              and a["name"].endswith(".gz")
-          ]
-          if not matches:
-              raise SystemExit("Linux amd64 Mihomo archive not found")
-          print(matches[0])
-          ' "$RELEASE")
-
-          echo "Downloading: $URL"
-          curl $CURL_OPTS "$URL" -o work/mihomo.gz
-
-          gzip -df work/mihomo.gz
-          chmod +x work/mihomo
-          work/mihomo -v
+          M_VER=$(curl $CURL_OPTS https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | \
+                  grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          echo "Latest mihomo version: $M_VER"
+          curl $CURL_OPTS -o mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v${M_VER}/mihomo-linux-amd64-v${M_VER}.gz
+          gunzip -f mihomo.gz
+          chmod +x mihomo
+          sudo mv mihomo /usr/local/bin/
+          mihomo -v
 
       - name: Build and validate MRS
         shell: bash
