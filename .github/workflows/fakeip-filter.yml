@@ -1,0 +1,84 @@
+
+name: Build fakeip-filter
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+  push:
+    paths:
+      - ".github/workflows/fakeip-filter.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download source lists
+        run: |
+          set -euo pipefail
+          mkdir -p work
+
+          curl -fLsS \
+            "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/fakeip-filter.list" \
+            -o work/dustin.list
+
+          curl -fLsS \
+            "https://github.com/wwqgtxx/clash-rules/releases/download/202610140116/fakeip-filter.list" \
+            -o work/wwqgtxx.list
+
+          test -s work/dustin.list
+          test -s work/wwqgtxx.list
+
+      - name: Merge and deduplicate
+        run: |
+          set -euo pipefail
+
+          cat work/dustin.list work/wwqgtxx.list \
+            | sed '/^[[:space:]]*$/d' \
+            | awk '!seen[$0]++' \
+            > work/fakeip-filter.list
+
+          test -s work/fakeip-filter.list
+
+      - name: Build Mihomo
+        run: |
+          set -euo pipefail
+          VERSION="1.19.18"
+
+          curl -fLsS \
+            "https://github.com/MetaCubeX/mihomo/releases/download/v${VERSION}/mihomo-linux-amd64-v${VERSION}.gz" \
+            -o work/mihomo.gz
+
+          gzip -df work/mihomo.gz
+          chmod +x work/mihomo
+
+          work/mihomo convert-ruleset domain text \
+            work/fakeip-filter.list \
+            fakeip-filter.mrs
+
+          test -s fakeip-filter.mrs
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          mkdir -p rules
+          cp fakeip-filter.mrs rules/fakeip-filter.mrs
+          cp work/fakeip-filter.list rules/fakeip-filter.list
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add rules/fakeip-filter.mrs rules/fakeip-filter.list
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update fakeip-filter rules"
+            git push
+          fi
