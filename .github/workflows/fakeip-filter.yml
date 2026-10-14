@@ -63,7 +63,7 @@ jobs:
           for source in sources:
               for line in source.read_text(encoding="utf-8-sig").splitlines():
                   line = line.strip()
-                  if not line or line in seen:
+                  if not line or line.startswith("#") or line in seen:
                       continue
                   seen.add(line)
                   merged.append(line)
@@ -103,6 +103,24 @@ jobs:
 
           echo "Generated files:"
           ls -lh work/fakeip-filter.list work/fakeip-filter.mrs
+
+      - name: Check for suspicious rule count drop
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          new_count=$(awk 'NF { n++ } END { print n+0 }' work/fakeip-filter.list)
+          echo "New rules: $new_count"
+
+          if [ -f rules/fakeip-filter.list ]; then
+            old_count=$(awk 'NF { n++ } END { print n+0 }' rules/fakeip-filter.list)
+            echo "Previous rules: $old_count"
+
+            if [ "$old_count" -gt 0 ] && [ "$new_count" -lt "$((old_count * 70 / 100))" ]; then
+              echo "::error::Rule count dropped by more than 30%"
+              exit 1
+            fi
+          fi
 
 
       - name: Publish generated files
