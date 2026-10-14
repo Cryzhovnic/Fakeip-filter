@@ -95,7 +95,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          work/mihomo convert-ruleset domain text \
+          mihomo convert-ruleset domain text \
             work/fakeip-filter.list \
             work/fakeip-filter.mrs
 
