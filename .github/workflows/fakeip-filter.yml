@@ -45,41 +45,79 @@ jobs:
           echo "wwqgtxx lines: $(wc -l < work/wwqgtxx.list)"
 
       - name: Merge and deduplicate
+        id: merge
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
-
+          import os
+      
           sources = [
-              Path("work/dustin.list"),
-              Path("work/wwqgtxx.list"),
+              ("dustin", Path("work/dustin.list")),
+              ("wwqgtxx", Path("work/wwqgtxx.list")),
           ]
-
+      
           seen = set()
           merged = []
-
-          for source in sources:
-              for line in source.read_text(encoding="utf-8-sig").splitlines():
+          per_source = {}   # сколько уникальных правил пришло из источника
+          raw_valid = {}    # сколько валидных строк (без # и пустых) в источнике
+      
+          for name, path in sources:
+              count_raw = 0
+              count_new = 0
+              for line in path.read_text(encoding="utf-8-sig").splitlines():
                   line = line.strip()
-                  if not line or line.startswith("#") or line in seen:
+                  if not line or line.startswith("#"):
+                      continue
+                  count_raw += 1
+                  if line in seen:
                       continue
                   seen.add(line)
                   merged.append(line)
-
+                  count_new += 1
+              raw_valid[name] = count_raw
+              per_source[name] = count_new
+      
+          # Предпочитаем +.domain вместо *.domain
+          star = {}
+          plus = set()
+          for line in merged:
+              if line.startswith("*."):
+                  star[line[2:]] = line
+              elif line.startswith("+."):
+                  plus.add(line[2:])
+          to_remove = {star[d] for d in star if d in plus}
+          if to_remove:
+              merged = [l for l in merged if l not in to_remove]
+      
           if not merged:
               raise SystemExit("Merged list is empty")
-
-          # Сортировка (стабильные diff'ы)
+      
           merged.sort(key=str.lower)
-
           Path("work/fakeip-filter.list").write_text(
-              "\n".join(merged) + "\n",
-              encoding="utf-8",
+              "\n".join(merged) + "\n", encoding="utf-8"
           )
-
-          print(f"Unique rules: {len(merged)}")
+      
+          total_raw = sum(raw_valid.values())
+          duplicates = total_raw - sum(per_source.values())
+          final = len(merged)
+      
+          print(f"DustinWin valid: {raw_valid['dustin']}, unique added: {per_source['dustin']}")
+          print(f"wwqgtxx  valid: {raw_valid['wwqgtxx']}, unique added: {per_source['wwqgtxx']}")
+          print(f"Duplicates skipped: {duplicates}")
+          print(f"*. removed due to +.: {len(to_remove)}")
+          print(f"Final unique rules: {final}")
+      
+          # для commit / release
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"dustin_raw={raw_valid['dustin']}\n")
+              f.write(f"dustin_new={per_source['dustin']}\n")
+              f.write(f"wwqgtxx_raw={raw_valid['wwqgtxx']}\n")
+              f.write(f"wwqgtxx_new={per_source['wwqgtxx']}\n")
+              f.write(f"duplicates={duplicates}\n")
+              f.write(f"star_removed={len(to_remove)}\n")
+              f.write(f"final={final}\n")
           PY
       
       - name: Get latest Mihomo version
@@ -130,18 +168,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           new_count=$(awk 'NF { n++ } END { print n+0 }' work/fakeip-filter.list)
           echo "New rules: $new_count"
-
+      
+          # Абсолютный минимум
+          if [ "$new_count" -lt 400 ]; then
+            echo "::error::Rule count too low ($new_count < 400)"
+            exit 1
+          fi
+      
           if [ -f rules/fakeip-filter.list ]; then
             old_count=$(awk 'NF { n++ } END { print n+0 }' rules/fakeip-filter.list)
             echo "Previous rules: $old_count"
-
             if [ "$old_count" -gt 0 ] && [ "$new_count" -lt "$((old_count * 70 / 100))" ]; then
               echo "::error::Rule count dropped by more than 30%"
               echo "=== Diff (removed / added) ==="
-              # показываем только различия
               sort rules/fakeip-filter.list > /tmp/old.sorted
               sort work/fakeip-filter.list  > /tmp/new.sorted
               echo "--- Removed ---"
@@ -152,33 +193,32 @@ jobs:
             fi
           fi
 
-
       - name: Publish generated files
         id: publish
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p rules
           cp work/fakeip-filter.list rules/fakeip-filter.list
           cp work/fakeip-filter.mrs rules/fakeip-filter.mrs
-
+      
           git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add rules/fakeip-filter.list rules/fakeip-filter.mrs
-
+      
           if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Rules unchanged; no release needed"
             exit 0
           fi
-
-          RULE_COUNT=$(wc -l < rules/fakeip-filter.list)
-          git commit -m "Update fakeip-filter rules (${RULE_COUNT} rules)"
+      
+          git commit -m "Update fakeip-filter rules (${{ steps.merge.outputs.final }} rules)" -m "Sources:
+          - DustinWin: ${{ steps.merge.outputs.dustin_raw }} → ${{ steps.merge.outputs.dustin_new }} unique
+          - wwqgtxx: ${{ steps.merge.outputs.wwqgtxx_raw }} → ${{ steps.merge.outputs.wwqgtxx_new }} unique
+          Duplicates: ${{ steps.merge.outputs.duplicates }}
+          *. removed (kept +.): ${{ steps.merge.outputs.star_removed }}"
+      
           git push
-
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Create release
@@ -187,7 +227,17 @@ jobs:
         with:
           tag_name: fakeip-${{ github.run_id }}-${{ github.run_attempt }}
           name: fakeip-filter update ${{ github.run_number }}
-          body: Automated update of merged fakeip-filter rules.
+          body: |
+            Automated merge of fakeip-filter sources.
+      
+            | Source | Valid lines | Unique added |
+            |--------|-------------|--------------|
+            | DustinWin | ${{ steps.merge.outputs.dustin_raw }} | ${{ steps.merge.outputs.dustin_new }} |
+            | wwqgtxx | ${{ steps.merge.outputs.wwqgtxx_raw }} | ${{ steps.merge.outputs.wwqgtxx_new }} |
+      
+            - Duplicates skipped: ${{ steps.merge.outputs.duplicates }}
+            - `*.` removed (kept `+.`): ${{ steps.merge.outputs.star_removed }}
+            - **Final rules: ${{ steps.merge.outputs.final }}**
           make_latest: true
           files: |
             work/fakeip-filter.mrs
