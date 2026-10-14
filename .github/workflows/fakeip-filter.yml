@@ -104,7 +104,9 @@ jobs:
           echo "Generated files:"
           ls -lh work/fakeip-filter.list work/fakeip-filter.mrs
 
+
       - name: Publish generated files
+        id: publish
         shell: bash
         run: |
           set -euo pipefail
@@ -120,9 +122,25 @@ jobs:
           git add rules/fakeip-filter.list rules/fakeip-filter.mrs
 
           if git diff --cached --quiet; then
-            echo "No changes to publish"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Rules unchanged; no release needed"
             exit 0
           fi
 
           git commit -m "Update fakeip-filter rules"
           git push
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        if: steps.publish.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fakeip-${{ github.run_id }}
+          name: fakeip-filter update ${{ github.run_number }}
+          body: Automated update of merged fakeip-filter rules.
+          make_latest: true
+          files: |
+            work/fakeip-filter.mrs
+            work/fakeip-filter.list
+
