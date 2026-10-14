@@ -164,6 +164,36 @@ jobs:
           echo "Generated files:"
           ls -lh work/fakeip-filter.list work/fakeip-filter.mrs
 
+      - name: Test mihomo loads MRS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > work/test-config.yaml << 'EOF'
+          mixed-port: 0
+          allow-lan: false
+          mode: rule
+          log-level: error
+          dns:
+            enable: true
+            enhanced-mode: fake-ip
+            fake-ip-range: 198.18.0.1/16
+            fake-ip-filter:
+              - rule-set:fakeip
+            nameserver:
+              - 8.8.8.8
+          rule-providers:
+            fakeip:
+              type: file
+              behavior: domain
+              format: mrs
+              path: work/fakeip-filter.mrs
+          rules:
+            - MATCH,DIRECT
+          EOF
+      
+          mihomo -t -f work/test-config.yaml
+          echo "Mihomo config + MRS load OK"
+
       - name: Check for suspicious rule count drop
         shell: bash
         run: |
