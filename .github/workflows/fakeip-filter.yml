@@ -185,7 +185,7 @@ jobs:
         if: steps.publish.outputs.changed == 'true'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: fakeip-${{ github.run_id }}
+          tag_name: fakeip-${{ github.run_id }}-${{ github.run_attempt }}
           name: fakeip-filter update ${{ github.run_number }}
           body: Automated update of merged fakeip-filter rules.
           make_latest: true
