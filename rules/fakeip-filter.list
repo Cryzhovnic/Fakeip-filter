@@ -555,7 +555,6 @@ xtratime.qcomgeo2.com
 +.wowsgame.cn
 +.xiami.com
 +.y.qq.com
-#LAN
 *
 *.lan
 *.localdomain
@@ -566,7 +565,6 @@ xtratime.qcomgeo2.com
 *.local
 *.home.arpa
 *.direct
-#放行NTP服务
 time.*.com
 time.*.gov
 time.*.edu.cn
@@ -590,68 +588,31 @@ ntp7.*.com
 *.time.edu.cn
 *.ntp.org.cn
 time1.cloud.tencent.com
-#放行网易云音乐
 music.163.com
 *.music.163.com
 *.126.net
-#百度音乐
-#酷狗音乐
-#酷我音乐
 *.kuwo.cn
-#JOOX音乐
-#QQ音乐
 y.qq.com
 *.y.qq.com
-#虾米音乐
 *.xiami.com
-#咪咕音乐
 *.music.migu.cn
 music.migu.cn
-#win10本地连接检测
-#QQ登录
-#微信登录
 localhost.*.weixin.qq.com
-#Game
-#Steam
-#Nintendo Switch
 *.n.n.srv.nintendo.net
-#Microsoft Xbox
 xbox.*.*.microsoft.com
 *.*.xboxlive.com
 xbox.*.microsoft.com
-#Wotgame
-#Golang
-#STUN
 +.stun.*.*
 +.stun.*.*.*
 +.stun.*.*.*.*
 +.stun.*.*.*.*.*
-#Linksys Router
 *.linksys.com
 *.linksyssmartwifi.com
-#ASUS Router
 *.router.asus.com
-#Apple Software Update Service
-#Google
-#FinalFantasy XIV Worldwide Server & CN Server
 *.square-enix.com
 *.finalfantasyxiv.com
 *.ffxiv.com
 *.ff14.sdo.com
-#Bilibili
 *.mcdn.bilivideo.cn
-#Disney Plus
-#shark007 Codecs
-#Mijia
 Mijia Cloud
-#Xiaomi
-#招商银行
-#AdGuard
-#迅雷
-#T-mobile and Ultra Mobile wifi calling
-#UU Plugin
-#Wifi Calling
 +.pub.3gppnetwork.org
-#向日葵远程控制
-#LOL语音
-#ddns
