@@ -5,80 +5,142 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 4 * * *"
-  push:
-    paths:
-      - ".github/workflows/fakeip-filter.yml"
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-fakeip-filter
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      CURL_OPTS: -fsSL --retry 3 --retry-delay 2 --retry-connrefused
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
       - name: Download source lists
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p work
 
-          curl -fLsS \
+          curl $CURL_OPTS \
             "https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/fakeip-filter.list" \
             -o work/dustin.list
 
-          curl -fLsS \
+          curl $CURL_OPTS \
             "https://raw.githubusercontent.com/wwqgtxx/clash-rules/release/fakeip-filter.list" \
             -o work/wwqgtxx.list
 
           test -s work/dustin.list
           test -s work/wwqgtxx.list
 
+          echo "DustinWin lines: $(wc -l < work/dustin.list)"
+          echo "wwqgtxx lines: $(wc -l < work/wwqgtxx.list)"
+
       - name: Merge and deduplicate
+        shell: bash
         run: |
           set -euo pipefail
 
-          cat work/dustin.list work/wwqgtxx.list \
-            | sed '/^[[:space:]]*$/d' \
-            | awk '!seen[$0]++' \
-            > work/fakeip-filter.list
+          python3 - <<'PY'
+          from pathlib import Path
 
-          test -s work/fakeip-filter.list
+          sources = [
+              Path("work/dustin.list"),
+              Path("work/wwqgtxx.list"),
+          ]
 
-      - name: Build Mihomo
+          seen = set()
+          merged = []
+
+          for source in sources:
+              for line in source.read_text(encoding="utf-8-sig").splitlines():
+                  line = line.strip()
+                  if not line or line in seen:
+                      continue
+                  seen.add(line)
+                  merged.append(line)
+
+          if not merged:
+              raise SystemExit("Merged list is empty")
+
+          Path("work/fakeip-filter.list").write_text(
+              "\n".join(merged) + "\n",
+              encoding="utf-8",
+          )
+
+          print(f"Unique rules: {len(merged)}")
+          PY
+
+      - name: Install latest Mihomo
+        shell: bash
         run: |
           set -euo pipefail
-          VERSION="1.19.18"
 
-          curl -fLsS \
-            "https://github.com/MetaCubeX/mihomo/releases/download/v${VERSION}/mihomo-linux-amd64-v${VERSION}.gz" \
-            -o work/mihomo.gz
+          RELEASE=$(curl $CURL_OPTS \
+            https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)
+
+          URL=$(python3 -c '
+          import json, sys
+          release = json.loads(sys.argv[1])
+          assets = release["assets"]
+          matches = [
+              a["browser_download_url"] for a in assets
+              if "linux-amd64" in a["name"]
+              and a["name"].endswith(".gz")
+          ]
+          if not matches:
+              raise SystemExit("Linux amd64 Mihomo archive not found")
+          print(matches[0])
+          ' "$RELEASE")
+
+          echo "Downloading: $URL"
+          curl $CURL_OPTS "$URL" -o work/mihomo.gz
 
           gzip -df work/mihomo.gz
           chmod +x work/mihomo
+          work/mihomo -v
+
+      - name: Build and validate MRS
+        shell: bash
+        run: |
+          set -euo pipefail
 
           work/mihomo convert-ruleset domain text \
             work/fakeip-filter.list \
-            fakeip-filter.mrs
+            work/fakeip-filter.mrs
 
-          test -s fakeip-filter.mrs
+          test -s work/fakeip-filter.mrs
 
-      - name: Publish
+          echo "Generated files:"
+          ls -lh work/fakeip-filter.list work/fakeip-filter.mrs
+
+      - name: Publish generated files
+        shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p rules
-          cp fakeip-filter.mrs rules/fakeip-filter.mrs
           cp work/fakeip-filter.list rules/fakeip-filter.list
+          cp work/fakeip-filter.mrs rules/fakeip-filter.mrs
 
           git config user.name "github-actions[bot]"
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add rules/fakeip-filter.mrs rules/fakeip-filter.list
+          git add rules/fakeip-filter.list rules/fakeip-filter.mrs
 
-          if ! git diff --cached --quiet; then
-            git commit -m "Update fakeip-filter rules"
-            git push
+          if git diff --cached --quiet; then
+            echo "No changes to publish"
+            exit 0
           fi
+
+          git commit -m "Update fakeip-filter rules"
+          git push
