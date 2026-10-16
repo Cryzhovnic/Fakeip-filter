@@ -1,8 +1,26 @@
-
+# =============================================================================
+# Build fakeip-filter  (ревизия с правками)
+#
+# Метки изменений относительно прошлой версии (для дебага):
+#   [#1]  тест загрузки MRS: путь относительно home-директории mihomo + негативный контроль
+#   [#2]  keepalive-джоб: GitHub отключает schedule после 60 дней без активности
+#   [#3]  нормализация регистра (.lower()) при слиянии
+#   [#4]  input force для обхода порога -30%
+#   [ЖЕЛ] пункты из «желательно»: токен для API, умный прунинг, коммит только при
+#         изменении .list, timeout, step summary, без кэша mihomo, проверка формата,
+#         очистка старых релизов
+# =============================================================================
 name: Build fakeip-filter
 
 on:
   workflow_dispatch:
+    inputs:
+      # [#4] Ручной обход проверки "список сократился более чем на 30%".
+      # Нужен, если апстрим легитимно урезал список и воркфлоу иначе застрянет.
+      force:
+        description: "Пропустить проверку падения количества правил (-30%)"
+        type: boolean
+        default: false
   schedule:
     - cron: "17 4 * * *"
 
@@ -14,11 +32,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # [#2] Отдельный джоб, чтобы keepalive отработал даже если build упал.
+  # Без него GitHub отключит cron-расписание после 60 дней без активности в репо
+  # (а мы коммитим только при изменениях). v2 работает через API, без пустых коммитов.
+  # Если расписание всё же отключилось: Actions -> воркфлоу -> "Enable workflow".
+  # ---------------------------------------------------------------------------
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: gautamkrishnar/keepalive-workflow@v2
+
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10 # [ЖЕЛ] защита от зависшего curl и т.п.
 
     env:
       CURL_OPTS: -fsSL --retry 3 --retry-delay 2 --retry-connrefused
+      GH_TOKEN: ${{ github.token }} # [ЖЕЛ] для api.github.com (лимит 60/ч без токена) и gh CLI
+      KEEP_RELEASES: "30" # [ЖЕЛ] сколько последних релизов fakeip-* хранить
 
     steps:
       - name: Checkout repository
@@ -52,23 +87,38 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import os
-      
+          import re
+
           sources = [
               ("dustin", Path("work/dustin.list")),
               ("wwqgtxx", Path("work/wwqgtxx.list")),
           ]
-      
+
+          # [ЖЕЛ] Проверка формата. В fake-ip-filter допустимы маски вида
+          # +.a.com, *.a.com, .a.com, time.*.com, поэтому whitelist-regex не
+          # используем. Вместо этого ловим признаки ДРУГОГО формата:
+          # пробелы, запятые, двоеточия, кавычки (DOMAIN-SUFFIX,x / YAML payload: / "- 'x'").
+          BAD = re.compile(r"""[\s,:'"/\\#@]""")
+
           seen = set()
           merged = []
           per_source = {}   # сколько уникальных правил пришло из источника
           raw_valid = {}    # сколько валидных строк (без # и пустых) в источнике
-      
+          bad_lines = {}    # сколько строк отброшено как "не тот формат"
+
           for name, path in sources:
               count_raw = 0
               count_new = 0
+              count_bad = 0
               for line in path.read_text(encoding="utf-8-sig").splitlines():
-                  line = line.strip()
+                  # [#3] .lower(): Example.com и example.com - один и тот же домен
+                  line = line.strip().lower()
                   if not line or line.startswith("#"):
+                      continue
+                  if BAD.search(line):
+                      count_bad += 1
+                      if count_bad <= 5:
+                          print(f"::warning::{name}: пропущена подозрительная строка: {line[:80]}")
                       continue
                   count_raw += 1
                   if line in seen:
@@ -78,37 +128,65 @@ jobs:
                   count_new += 1
               raw_valid[name] = count_raw
               per_source[name] = count_new
-      
-          # Предпочитаем +.domain вместо *.domain
-          star = {}
-          plus = set()
-          for line in merged:
-              if line.startswith("*."):
-                  star[line[2:]] = line
-              elif line.startswith("+."):
-                  plus.add(line[2:])
-          to_remove = {star[d] for d in star if d in plus}
-          if to_remove:
-              merged = [l for l in merged if l not in to_remove]
-      
+              bad_lines[name] = count_bad
+              # Если апстрим сменил формат, "плохих" строк станет много -> падаем
+              # с понятной ошибкой, а не публикуем мусор.
+              if count_bad > max(5, 0.05 * (count_raw + count_bad)):
+                  raise SystemExit(
+                      f"{name}: слишком много строк в неожиданном формате "
+                      f"({count_bad} из {count_raw + count_bad}). Проверь источник."
+                  )
+
+          # [ЖЕЛ] Умный прунинг (заменяет прежнюю логику "+. вместо *.").
+          # Правило +.a.com покрывает a.com и ЛЮБЫЕ поддомены, поэтому лишние:
+          #   *.a.com, .a.com, a.com  (тот же домен)
+          #   x.a.com, *.x.a.com, +.x.a.com, ...  (любой вид правила для поддомена)
+          # Старый случай "*.d при наличии +.d" входит сюда же.
+          # Правила нестандартного вида (с * внутри и т.п.) не трогаем сами,
+          # но они могут быть покрыты предком.
+          def parse(rule):
+              for prefix, kind in (("+.", "+"), ("*.", "*"), (".", ".")):
+                  if rule.startswith(prefix):
+                      return kind, rule[len(prefix):]
+              return "", rule
+
+          parsed = [(r, *parse(r)) for r in merged]
+          plus = {base for _, kind, base in parsed if kind == "+"}
+
+          def covered(kind, base):
+              # тот же домен, но не "+."-форма (сама "+."-форма - это и есть покрывающее правило)
+              if kind != "+" and base in plus:
+                  return True
+              # любой собственный родительский домен покрыт правилом "+."
+              labels = base.split(".")
+              return any(".".join(labels[i:]) in plus for i in range(1, len(labels)))
+
+          pruned_rules = [r for r, kind, base in parsed if covered(kind, base)]
+          pruned_set = set(pruned_rules)
+          if pruned_set:
+              merged = [r for r in merged if r not in pruned_set]
+
           if not merged:
               raise SystemExit("Merged list is empty")
-      
-          merged.sort(key=str.lower)
+
+          merged.sort()  # всё уже lower() после [#3]
           Path("work/fakeip-filter.list").write_text(
               "\n".join(merged) + "\n", encoding="utf-8"
           )
-      
+
           total_raw = sum(raw_valid.values())
           duplicates = total_raw - sum(per_source.values())
+          pruned = len(pruned_set)
           final = len(merged)
-      
+          skipped_bad = sum(bad_lines.values())
+
           print(f"DustinWin valid: {raw_valid['dustin']}, unique added: {per_source['dustin']}")
           print(f"wwqgtxx  valid: {raw_valid['wwqgtxx']}, unique added: {per_source['wwqgtxx']}")
           print(f"Duplicates skipped: {duplicates}")
-          print(f"*. removed due to +.: {len(to_remove)}")
+          print(f"Skipped (unexpected format): {skipped_bad}")
+          print(f"Pruned (covered by +.): {pruned}")
           print(f"Final unique rules: {final}")
-      
+
           # для commit / release
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"dustin_raw={raw_valid['dustin']}\n")
@@ -116,46 +194,47 @@ jobs:
               f.write(f"wwqgtxx_raw={raw_valid['wwqgtxx']}\n")
               f.write(f"wwqgtxx_new={per_source['wwqgtxx']}\n")
               f.write(f"duplicates={duplicates}\n")
-              f.write(f"star_removed={len(to_remove)}\n")
+              f.write(f"pruned={pruned}\n")
               f.write(f"final={final}\n")
+
+          # [ЖЕЛ] Сводка на странице запуска
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("### Merge summary\n\n")
+              f.write("| Source | Valid lines | Unique added | Skipped (bad format) |\n")
+              f.write("|---|---|---|---|\n")
+              for key, label in (("dustin", "DustinWin"), ("wwqgtxx", "wwqgtxx")):
+                  f.write(f"| {label} | {raw_valid[key]} | {per_source[key]} | {bad_lines[key]} |\n")
+              f.write(f"\n- Duplicates skipped: {duplicates}\n")
+              f.write(f"- Pruned (covered by `+.`): {pruned}\n")
+              f.write(f"- **Final rules: {final}**\n")
           PY
-      
-      - name: Get latest Mihomo version
-        id: mihomo
-        run: |
-          set -euo pipefail
-          M_VER=$(curl $CURL_OPTS https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.tag_name | ltrimstr("v")')
-          echo "version=$M_VER" >> "$GITHUB_OUTPUT"
-          echo "Latest mihomo version: $M_VER"
-      
-      - name: Cache Mihomo binary
-        id: cache-mihomo
-        uses: actions/cache@v5
-        with:
-          path: work/mihomo
-          key: mihomo-linux-amd64-${{ steps.mihomo.outputs.version }}
-      
+
+      # [ЖЕЛ] Кэш mihomo убран: бинарник маленький, скачивается за секунды,
+      # а кэш добавлял 2 шага и ветвление. Токен нужен, чтобы не упереться в
+      # лимит неавторизованных запросов к api.github.com на общих раннерах.
       - name: Install Mihomo
+        shell: bash
         run: |
           set -euo pipefail
-          if [ ! -f work/mihomo ]; then
-            M_VER=${{ steps.mihomo.outputs.version }}
-            curl $CURL_OPTS -o mihomo.gz \
-              "https://github.com/MetaCubeX/mihomo/releases/download/v${M_VER}/mihomo-linux-amd64-v${M_VER}.gz"
-            gunzip -f mihomo.gz
-            mv mihomo work/mihomo
-          fi
+          M_VER=$(curl $CURL_OPTS -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+            | jq -r '.tag_name | ltrimstr("v")')
+          test -n "$M_VER" && [ "$M_VER" != "null" ]
+          echo "Latest mihomo version: $M_VER"
+
+          curl $CURL_OPTS -o work/mihomo.gz \
+            "https://github.com/MetaCubeX/mihomo/releases/download/v${M_VER}/mihomo-linux-amd64-v${M_VER}.gz"
+          gunzip -f work/mihomo.gz
           chmod +x work/mihomo
-          sudo cp work/mihomo /usr/local/bin/mihomo
-          mihomo -v
-          
+          # Без sudo cp: запускаем напрямую ./work/mihomo
+          ./work/mihomo -v
 
       - name: Build and validate MRS
         shell: bash
         run: |
           set -euo pipefail
 
-          mihomo convert-ruleset domain text \
+          ./work/mihomo convert-ruleset domain text \
             work/fakeip-filter.list \
             work/fakeip-filter.mrs
 
@@ -164,6 +243,9 @@ jobs:
           echo "Generated files:"
           ls -lh work/fakeip-filter.list work/fakeip-filter.mrs
 
+      # [#1] Раньше path был "work/fakeip-filter.mrs" - mihomo резолвит относительные
+      # пути провайдеров от своей HOME-директории (-d), а не от cwd, и требует, чтобы
+      # файл лежал внутри неё. Теперь: HOME = work/, path = просто имя файла.
       - name: Test mihomo loads MRS
         shell: bash
         run: |
@@ -186,32 +268,47 @@ jobs:
               type: file
               behavior: domain
               format: mrs
-              path: work/fakeip-filter.mrs
+              path: fakeip-filter.mrs
           rules:
             - MATCH,DIRECT
           EOF
-      
-          mihomo -t -f work/test-config.yaml
+
+          ./work/mihomo -d work -t -f work/test-config.yaml
           echo "Mihomo config + MRS load OK"
+
+          # [#1] Негативный контроль: подсовываем битый MRS. Если mihomo -t его
+          # "проглотил", значит тест выше слепой (не читает провайдер) - предупреждаем.
+          # Не фатально, чтобы не блокировать сборку; смотри ::warning:: в логе.
+          mkdir -p work/neg
+          cp work/test-config.yaml work/neg/test-config.yaml
+          head -c 256 /dev/urandom > work/neg/fakeip-filter.mrs
+          if ./work/mihomo -d work/neg -t -f work/neg/test-config.yaml >/dev/null 2>&1; then
+            echo "::warning::Негативный контроль НЕ упал: 'mihomo -t' не проверяет содержимое MRS. Тест загрузки малоинформативен."
+          else
+            echo "Negative control OK (битый MRS отвергнут)"
+          fi
+          rm -rf work/neg
 
       - name: Check for suspicious rule count drop
         shell: bash
+        env:
+          # [#4] пусто при запуске по расписанию, true/false при ручном запуске
+          FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
           new_count=$(awk 'NF { n++ } END { print n+0 }' work/fakeip-filter.list)
           echo "New rules: $new_count"
-      
-          # Абсолютный минимум
+
+          # Абсолютный минимум (force его НЕ обходит: защита от пустого/битого списка)
           if [ "$new_count" -lt 400 ]; then
             echo "::error::Rule count too low ($new_count < 400)"
             exit 1
           fi
-      
+
           if [ -f rules/fakeip-filter.list ]; then
             old_count=$(awk 'NF { n++ } END { print n+0 }' rules/fakeip-filter.list)
             echo "Previous rules: $old_count"
             if [ "$old_count" -gt 0 ] && [ "$new_count" -lt "$((old_count * 70 / 100))" ]; then
-              echo "::error::Rule count dropped by more than 30%"
               echo "=== Diff (removed / added) ==="
               sort rules/fakeip-filter.list > /tmp/old.sorted
               sort work/fakeip-filter.list  > /tmp/new.sorted
@@ -219,10 +316,22 @@ jobs:
               comm -23 /tmp/old.sorted /tmp/new.sorted | head -100
               echo "--- Added ---"
               comm -13 /tmp/old.sorted /tmp/new.sorted | head -100
-              exit 1
+
+              # [#4] обход порога
+              if [ "${FORCE:-}" = "true" ]; then
+                echo "::warning::Rule count dropped by more than 30% ($old_count -> $new_count), но force=true - продолжаем"
+              else
+                echo "::error::Rule count dropped by more than 30% ($old_count -> $new_count). Для обхода запусти вручную с force=true"
+                exit 1
+              fi
             fi
           fi
 
+      # [ЖЕЛ] Коммитим только если изменился .list (или .mrs ещё не в репо).
+      # Раньше новая версия mihomo могла иначе сериализовать .mrs при том же .list,
+      # что давало лишний коммит и релиз. Побочный эффект: .mrs обновляется
+      # вместе с .list, а не по обновлению mihomo - старые .mrs грузятся новыми
+      # версиями mihomo без проблем.
       - name: Publish generated files
         id: publish
         shell: bash
@@ -230,24 +339,26 @@ jobs:
           set -euo pipefail
           mkdir -p rules
           cp work/fakeip-filter.list rules/fakeip-filter.list
-          cp work/fakeip-filter.mrs rules/fakeip-filter.mrs
-      
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add rules/fakeip-filter.list rules/fakeip-filter.mrs
-      
-          if git diff --cached --quiet; then
+          git add rules/fakeip-filter.list
+
+          if git diff --cached --quiet && git ls-files --error-unmatch rules/fakeip-filter.mrs >/dev/null 2>&1; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Rules unchanged; no release needed"
             exit 0
           fi
-      
+
+          cp work/fakeip-filter.mrs rules/fakeip-filter.mrs
+          git add rules/fakeip-filter.mrs
+
           git commit -m "Update fakeip-filter rules (${{ steps.merge.outputs.final }} rules)" -m "Sources:
           - DustinWin: ${{ steps.merge.outputs.dustin_raw }} → ${{ steps.merge.outputs.dustin_new }} unique
           - wwqgtxx: ${{ steps.merge.outputs.wwqgtxx_raw }} → ${{ steps.merge.outputs.wwqgtxx_new }} unique
           Duplicates: ${{ steps.merge.outputs.duplicates }}
-          *. removed (kept +.): ${{ steps.merge.outputs.star_removed }}"
-      
+          Pruned (covered by +.): ${{ steps.merge.outputs.pruned }}"
+
           git push
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
@@ -258,7 +369,9 @@ jobs:
           set -euo pipefail
           echo "tag=fakeip-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
           echo "title=fakeip-filter $(date -u +'%Y-%m-%d %H:%M UTC') (${{ steps.merge.outputs.final }} rules)" >> "$GITHUB_OUTPUT"
-      
+
+      # Для сторонних экшенов можно закрепить коммит по SHA вместо тега
+      # (softprops/action-gh-release@<sha> # v3) - защита от подмены тега.
       - name: Create release
         if: steps.publish.outputs.changed == 'true'
         uses: softprops/action-gh-release@v3
@@ -267,17 +380,33 @@ jobs:
           name: ${{ steps.meta.outputs.title }}
           body: |
             Automated merge of fakeip-filter sources.
-      
+
             | Source | Valid lines | Unique added |
             |--------|-------------|--------------|
             | DustinWin | ${{ steps.merge.outputs.dustin_raw }} | ${{ steps.merge.outputs.dustin_new }} |
             | wwqgtxx | ${{ steps.merge.outputs.wwqgtxx_raw }} | ${{ steps.merge.outputs.wwqgtxx_new }} |
-      
+
             - Duplicates skipped: ${{ steps.merge.outputs.duplicates }}
-            - `*.` removed (kept `+.`): ${{ steps.merge.outputs.star_removed }}
+            - Pruned (covered by `+.`): ${{ steps.merge.outputs.pruned }}
             - **Final rules: ${{ steps.merge.outputs.final }}**
           make_latest: true
           files: |
             work/fakeip-filter.mrs
             work/fakeip-filter.list
 
+      # [ЖЕЛ] Чистим старые релизы fakeip-*, оставляем KEEP_RELEASES последних.
+      # Удаляются только релизы с тегом fakeip-*, остальные не трогаем.
+      # continue-on-error: сбой очистки не должен валить уже опубликованную сборку.
+      - name: Cleanup old releases
+        if: steps.publish.outputs.changed == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release list --limit 200 --json tagName,createdAt \
+            --jq "map(select(.tagName | startswith(\"fakeip-\"))) | sort_by(.createdAt) | reverse | .[${KEEP_RELEASES}:] | .[].tagName" \
+          | while read -r tag; do
+              [ -n "$tag" ] || continue
+              echo "Deleting old release: $tag"
+              gh release delete "$tag" --cleanup-tag --yes
+            done
