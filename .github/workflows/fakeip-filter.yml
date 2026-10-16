@@ -1,17 +1,19 @@
 # =============================================================================
 # Build fakeip-filter  (ревизия с правками)
 #
-# Метки изменений относительно прошлой версии (для дебага):
-#   [#1]  тест загрузки MRS: путь относительно home-директории mihomo + негативный контроль
+# Метки изменений относительно исходной версии (для дебага):
+#   [#1]  путь MRS в тест-конфиге - относительно home-директории mihomo (-d)
 #   [#2]  keepalive-джоб: GitHub отключает schedule после 60 дней без активности
 #   [#3]  нормализация регистра (.lower()) при слиянии
 #   [#4]  input force для обхода порога -30%
-#   [ЖЕЛ] пункты из «желательно»: токен для API, умный прунинг, коммит только при
-#         изменении .list, timeout, step summary, без кэша mihomo, проверка формата,
-#         очистка старых релизов
+#   [ЖЕЛ] токен для API, коммит только при изменении .list, timeout, step summary,
+#         без кэша mihomo, проверка формата, очистка старых релизов
 #   [v3]  keepalive: сторонний экшен заблокирован GitHub -> gh api .../enable;
-#         фильтр формата больше не режет строки с пробелом ("mijia cloud");
-#         негативный контроль заменён проверкой MRS -> text (round-trip)
+#         фильтр формата больше не режет строки с пробелом ("mijia cloud")
+#   [v4]  общий прунинг по маскам с "*" (+.stun.*.* покрывает stun.x.y, time.*.com покрывает time.google.com);
+#         smoke-тест на настоящем mihomo (DNS fake-ip) вместо слепого "mihomo -t";
+#         пороги (минимум 400 / падение -30%) считаются ДО прунинга; файл
+#         rules/fakeip-filter.stats хранит это число; input no_prune
 # =============================================================================
 name: Build fakeip-filter
 
@@ -19,9 +21,14 @@ on:
   workflow_dispatch:
     inputs:
       # [#4] Ручной обход проверки "список сократился более чем на 30%".
-      # Нужен, если апстрим легитимно урезал список и воркфлоу иначе застрянет.
       force:
         description: "Пропустить проверку падения количества правил (-30%)"
+        type: boolean
+        default: false
+      # [v4] Аварийный выключатель прунинга: если smoke-тест покажет, что реальный
+      # mihomo матчит маски иначе, чем в документации - соберёт список без выкидывания.
+      no_prune:
+        description: "Не выкидывать правила, покрытые масками (+.x.*.*)"
         type: boolean
         default: false
   schedule:
@@ -37,13 +44,10 @@ concurrency:
 jobs:
   # ---------------------------------------------------------------------------
   # [#2] Отдельный джоб, чтобы keepalive отработал даже если build упал.
-  # Без него GitHub отключит cron-расписание после 60 дней без активности в репо
-  # (а мы коммитим только при изменениях).
-  #
+  # Без него GitHub отключит cron-расписание после 60 дней без активности в репо.
   # [v3] gautamkrishnar/keepalive-workflow GitHub заблокировал ("Repository access
-  # blocked"), поэтому сторонний экшен убран. Вместо него - один вызов gh API:
-  # PUT .../actions/workflows/<file>/enable (стандартный приём для сброса таймера
-  # 60 дней). Имя файла берём из GITHUB_WORKFLOW_REF, ничего не хардкодим.
+  # blocked"), поэтому сторонний экшен убран: один вызов gh API
+  # PUT .../actions/workflows/<file>/enable (стандартный приём сброса таймера).
   # Если расписание всё же отключилось: Actions -> воркфлоу -> "Enable workflow".
   # ---------------------------------------------------------------------------
   keepalive:
@@ -98,9 +102,11 @@ jobs:
           echo "DustinWin lines: $(wc -l < work/dustin.list)"
           echo "wwqgtxx lines: $(wc -l < work/wwqgtxx.list)"
 
-      - name: Merge and deduplicate
+      - name: Merge, deduplicate and prune
         id: merge
         shell: bash
+        env:
+          NO_PRUNE: ${{ inputs.no_prune }} # [v4] пусто при запуске по расписанию
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -113,14 +119,13 @@ jobs:
               ("wwqgtxx", Path("work/wwqgtxx.list")),
           ]
 
-          # [ЖЕЛ] Проверка формата. В fake-ip-filter допустимы маски вида
-          # +.a.com, *.a.com, .a.com, time.*.com, поэтому whitelist-regex не
-          # используем. Вместо этого ловим признаки ДРУГОГО формата:
-          # запятые, двоеточия, кавычки (DOMAIN-SUFFIX,x / YAML payload: / "- 'x'").
-          # [v3] Пробел из чёрного списка УБРАН: "mijia cloud" - настоящее имя хоста
-          # устройств Xiaomi Mijia (умный дом), оно штатно есть в fake-ip-filter и
-          # должно попадать в итоговый список. Строки с пробелом больше не отбрасываются.
+          # [ЖЕЛ] Проверка формата: ловим признаки ДРУГОГО формата (DOMAIN-SUFFIX,x / YAML payload / "- 'x'").
+          # [v3] Пробел из чёрного списка убран: "mijia cloud" - настоящее имя хоста Xiaomi Mijia.
           BAD = re.compile(r"""[,:'"/\\#@]""")
+
+          # [v4] Ручное отключение прунинга (workflow_dispatch -> no_prune), если smoke-тест
+          # покажет, что реальный Mihomo матчит маски не так, как предполагалось.
+          NO_PRUNE = os.environ.get("NO_PRUNE", "").lower() == "true"
 
           seen = set()
           merged = []
@@ -151,54 +156,90 @@ jobs:
               raw_valid[name] = count_raw
               per_source[name] = count_new
               bad_lines[name] = count_bad
-              # Если апстрим сменил формат, "плохих" строк станет много -> падаем
-              # с понятной ошибкой, а не публикуем мусор.
+              # Если апстрим сменил формат, "плохих" строк станет много -> падаем с понятной ошибкой.
               if count_bad > max(5, 0.05 * (count_raw + count_bad)):
                   raise SystemExit(
                       f"{name}: слишком много строк в неожиданном формате "
                       f"({count_bad} из {count_raw + count_bad}). Проверь источник."
                   )
 
-          # [ЖЕЛ] Умный прунинг (заменяет прежнюю логику "+. вместо *.").
-          # Правило +.a.com покрывает a.com и ЛЮБЫЕ поддомены, поэтому лишние:
-          #   *.a.com, .a.com, a.com  (тот же домен)
-          #   x.a.com, *.x.a.com, +.x.a.com, ...  (любой вид правила для поддомена)
-          # Старый случай "*.d при наличии +.d" входит сюда же.
-          # Правила нестандартного вида (с * внутри и т.п.) не трогаем сами,
-          # но они могут быть покрыты предком.
+          # ---------------------------------------------------------------------------
+          # ---------------------------------------------------------------------------
+          # [v4] Общий прунинг. Правило выкидывается, если ВСЕ домены, которые оно матчит,
+          # уже матчатся другим правилом-маской. Семантика Mihomo (wiki.metacubex.one):
+          #   +.x.y   - любое число уровней слева (включая ноль): сам x.y и все поддомены
+          #   *       - ровно один label (в т.ч. в середине: stun.*.*, time.*.com)
+          #   .x.y    - только поддомены x.y
+          # Покрыватели двух видов:
+          #   1) "+."-маски (в т.ч. с "*" внутри): +.stun.*.* покрывает stun.12connect.com,
+          #      +.a.com покрывает *.a.com, a.com, x.a.com, *.x.a.com, +.x.a.com
+          #      (заменяет прежнюю логику "*. при +.");
+          #   2) точные маски с "*" и тем же числом labels: time.*.com покрывает time.google.com.
+          #      Одиночное "*" (имена без точек) покрывателем НЕ считаем: слишком широко/неочевидно.
+          # Правила с "+." / "." (бесконечные множества) точными масками не покрываются.
+          # ---------------------------------------------------------------------------
           def parse(rule):
-              for prefix, kind in (("+.", "+"), ("*.", "*"), (".", ".")):
-                  if rule.startswith(prefix):
-                      return kind, rule[len(prefix):]
-              return "", rule
+              if rule.startswith("+."):
+                  return "+", rule[2:].split(".")
+              if rule.startswith("."):
+                  return ".", rule[1:].split(".")
+              return "", rule.split(".")          # plain или "*.x" (точное число labels)
 
-          parsed = [(r, *parse(r)) for r in merged]
-          plus = {base for _, kind, base in parsed if kind == "+"}
 
-          def covered(kind, base):
-              # тот же домен, но не "+."-форма (сама "+."-форма - это и есть покрывающее правило)
-              if kind != "+" and base in plus:
-                  return True
-              # любой собственный родительский домен покрыт правилом "+."
-              labels = base.split(".")
-              return any(".".join(labels[i:]) in plus for i in range(1, len(labels)))
+          def mask_covers(mask, labels):
+              """+.mask покрывает всё, что оканчивается на labels. '*' в маске матчит любой label
+              (в т.ч. '*' самого правила); литерал в маске - только такой же литерал."""
+              if len(labels) < len(mask):
+                  return False
+              return all(m == "*" or m == l for m, l in zip(mask, labels[-len(mask):]))
 
-          pruned_rules = [r for r, kind, base in parsed if covered(kind, base)]
-          pruned_set = set(pruned_rules)
-          if pruned_set:
-              merged = [r for r in merged if r not in pruned_set]
+
+          def exact_covers(mask, labels):
+              """Точная маска (без +.) покрывает правило с тем же числом labels."""
+              return len(mask) == len(labels) and all(m == "*" or m == l for m, l in zip(mask, labels))
+
+
+          def prune(rules):
+              parsed = [(r, *parse(r)) for r in rules]
+              # короткие правила первыми (покрыватель всегда не длиннее покрываемого);
+              # при равной длине маски ("+." и с "*") раньше обычных доменов
+              order = sorted(parsed, key=lambda p: (len(p[2]), 0 if (p[1] == "+" or "*" in p[2]) else 1, p[0]))
+              plus_masks = []    # уже оставленные "+."-правила
+              exact_masks = []   # уже оставленные точные маски с "*" (>= 2 labels)
+              dropped = {}       # правило -> правило-покрыватель
+              for rule, kind, labels in order:
+                  cov = next((mr for mr, m in plus_masks if mr != rule and mask_covers(m, labels)), None)
+                  if cov is None and kind == "":
+                      cov = next((mr for mr, m in exact_masks if mr != rule and exact_covers(m, labels)), None)
+                  if cov:
+                      dropped[rule] = cov
+                  elif kind == "+":
+                      plus_masks.append((rule, labels))
+                  elif kind == "" and "*" in labels and len(labels) >= 2:
+                      exact_masks.append((rule, labels))
+              return [r for r in rules if r not in dropped], dropped
+
+
+          pre = len(merged)   # число правил ДО прунинга: именно по нему сверяем здоровье апстрима
+          if NO_PRUNE:
+              dropped = {}
+          else:
+              merged, dropped = prune(merged)
 
           if not merged:
               raise SystemExit("Merged list is empty")
 
           merged.sort()  # всё уже lower() после [#3]
-          Path("work/fakeip-filter.list").write_text(
-              "\n".join(merged) + "\n", encoding="utf-8"
+          Path("work/fakeip-filter.list").write_text("\n".join(merged) + "\n", encoding="utf-8")
+          Path("work/stats.txt").write_text(f"{pre}\n", encoding="utf-8")
+          # что и чем покрыто - для smoke-теста и для отладки
+          Path("work/pruned.txt").write_text(
+              "".join(f"{r}\t{c}\n" for r, c in sorted(dropped.items())), encoding="utf-8"
           )
 
           total_raw = sum(raw_valid.values())
           duplicates = total_raw - sum(per_source.values())
-          pruned = len(pruned_set)
+          pruned = len(dropped)
           final = len(merged)
           skipped_bad = sum(bad_lines.values())
 
@@ -206,7 +247,8 @@ jobs:
           print(f"wwqgtxx  valid: {raw_valid['wwqgtxx']}, unique added: {per_source['wwqgtxx']}")
           print(f"Duplicates skipped: {duplicates}")
           print(f"Skipped (unexpected format): {skipped_bad}")
-          print(f"Pruned (covered by +.): {pruned}")
+          print(f"Before pruning: {pre}")
+          print(f"Pruned (covered by masks): {pruned}{' (prune disabled)' if NO_PRUNE else ''}")
           print(f"Final unique rules: {final}")
 
           # для commit / release
@@ -216,6 +258,7 @@ jobs:
               f.write(f"wwqgtxx_raw={raw_valid['wwqgtxx']}\n")
               f.write(f"wwqgtxx_new={per_source['wwqgtxx']}\n")
               f.write(f"duplicates={duplicates}\n")
+              f.write(f"pre={pre}\n")
               f.write(f"pruned={pruned}\n")
               f.write(f"final={final}\n")
 
@@ -227,13 +270,22 @@ jobs:
               for key, label in (("dustin", "DustinWin"), ("wwqgtxx", "wwqgtxx")):
                   f.write(f"| {label} | {raw_valid[key]} | {per_source[key]} | {bad_lines[key]} |\n")
               f.write(f"\n- Duplicates skipped: {duplicates}\n")
-              f.write(f"- Pruned (covered by `+.`): {pruned}\n")
+              f.write(f"- Before pruning: {pre}\n")
+              f.write(f"- Pruned (covered by masks): {pruned}\n")
               f.write(f"- **Final rules: {final}**\n")
+              if dropped:
+                  by = {}
+                  for r, c in dropped.items():
+                      by.setdefault(c, []).append(r)
+                  f.write(f"\n<details><summary>Pruned rules by covering mask ({len(by)} masks)</summary>\n\n")
+                  for c, v in sorted(by.items(), key=lambda x: -len(x[1])):
+                      f.write(f"- `{c}` covers {len(v)}: " + ", ".join(f"`{x}`" for x in sorted(v)[:8])
+                              + (" ..." if len(v) > 8 else "") + "\n")
+                  f.write("\n</details>\n")
           PY
 
-      # [ЖЕЛ] Кэш mihomo убран: бинарник маленький, скачивается за секунды,
-      # а кэш добавлял 2 шага и ветвление. Токен нужен, чтобы не упереться в
-      # лимит неавторизованных запросов к api.github.com на общих раннерах.
+      # [ЖЕЛ] Кэш mihomo убран: бинарник маленький, скачивается за секунды.
+      # Токен нужен, чтобы не упереться в лимит неавторизованных запросов к api.github.com.
       - name: Install Mihomo
         shell: bash
         run: |
@@ -248,10 +300,9 @@ jobs:
             "https://github.com/MetaCubeX/mihomo/releases/download/v${M_VER}/mihomo-linux-amd64-v${M_VER}.gz"
           gunzip -f work/mihomo.gz
           chmod +x work/mihomo
-          # Без sudo cp: запускаем напрямую ./work/mihomo
           ./work/mihomo -v
 
-      - name: Build and validate MRS
+      - name: Build MRS
         shell: bash
         run: |
           set -euo pipefail
@@ -265,20 +316,142 @@ jobs:
           echo "Generated files:"
           ls -lh work/fakeip-filter.list work/fakeip-filter.mrs
 
-      # [#1] Раньше path был "work/fakeip-filter.mrs" - mihomo резолвит относительные
-      # пути провайдеров от своей HOME-директории (-d), а не от cwd, и требует, чтобы
-      # файл лежал внутри неё. Теперь: HOME = work/, path = просто имя файла.
-      - name: Test mihomo loads MRS
+      # [v4] Заменяет прежний "Test mihomo loads MRS": как показал негативный контроль,
+      # 'mihomo -t' проверяет только конфиг и содержимое MRS не читает. Здесь mihomo
+      # реально запускается с fake-ip DNS и этим MRS, и мы спрашиваем у него домены:
+      # домен из фильтра получает реальный ответ, остальные - 198.18.x.x. Проверяем и
+      # выкинутые прунингом правила (маска правда их покрывает), и оставленные.
+      # Если упало на pruned-доменах: запусти воркфлоу вручную с no_prune=true.
+      - name: Smoke test (real mihomo, fake-ip DNS)
         shell: bash
+        timeout-minutes: 5
         run: |
           set -euo pipefail
-          cat > work/test-config.yaml << 'EOF'
-          mixed-port: 0
-          allow-lan: false
-          mode: rule
-          log-level: error
+          python3 - <<'PY'
+          # Smoke-тест fake-ip фильтра на НАСТОЯЩЕМ mihomo.
+          # Идея: в режиме fake-ip домен, попавший в fake-ip-filter, получает РЕАЛЬНЫЙ ответ
+          # (или NXDOMAIN), а все остальные - адрес из 198.18.0.0/16 без обращения к upstream.
+          # Значит "ответ из 198.18.x.x" = "домен в фильтр НЕ попал". Проверяем:
+          #   1) контрольные домены вне списка ОБЯЗАНЫ получить fake-ip (иначе тест слепой);
+          #   2) для каждого выкинутого прунингом правила - конкретные домены, которые оно
+          #      матчило, НЕ должны получить fake-ip (прунинг ничего не потерял);
+          #   3) то же для оставшихся правил (MRS реально загрузился и работает).
+          import os
+          import random
+          import shutil
+          import socket
+          import struct
+          import subprocess
+          import sys
+          import time
+          from concurrent.futures import ThreadPoolExecutor
+          from pathlib import Path
+
+          MIHOMO = os.environ.get("MIHOMO_BIN", "./work/mihomo")
+          PORT = int(os.environ.get("SMOKE_PORT", "1053"))
+          MAX_PROBES = int(os.environ.get("SMOKE_MAX_PROBES", "1500"))
+          PROBE = "smoke-probe"
+          FAKE_PREFIX = "198.18."
+
+
+          def skip_name(data, pos):
+              while True:
+                  n = data[pos]
+                  if n == 0:
+                      return pos + 1
+                  if n & 0xC0 == 0xC0:
+                      return pos + 2
+                  pos += n + 1
+
+
+          def query(name, timeout=4.0):
+              """A-запрос к локальному mihomo. None - таймаут, "skip" - имя не закодировать."""
+              try:
+                  labels = [l.encode("ascii") for l in name.split(".")]
+              except UnicodeEncodeError:
+                  try:
+                      labels = [l.encode("idna") for l in name.split(".")]
+                  except UnicodeError:
+                      return "skip"
+              if any(not 1 <= len(l) <= 63 for l in labels):
+                  return "skip"
+              tid = random.randrange(65536)
+              pkt = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+              pkt += b"".join(bytes([len(l)]) + l for l in labels) + b"\x00" + struct.pack(">HH", 1, 1)
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              s.settimeout(timeout)
+              try:
+                  s.sendto(pkt, ("127.0.0.1", PORT))
+                  data, _ = s.recvfrom(4096)
+              except socket.timeout:
+                  return None
+              finally:
+                  s.close()
+              if len(data) < 12 or struct.unpack(">H", data[:2])[0] != tid:
+                  return None
+              flags, qd, an = struct.unpack(">HHH", data[2:8])
+              pos = 12
+              for _ in range(qd):
+                  pos = skip_name(data, pos) + 4
+              ips = []
+              for _ in range(an):
+                  pos = skip_name(data, pos)
+                  typ, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
+                  pos += 10
+                  if typ == 1 and rdlen == 4:
+                      ips.append(".".join(str(b) for b in data[pos:pos + 4]))
+                  pos += rdlen
+              return flags & 0xF, ips
+
+
+          def is_fake(res):
+              return isinstance(res, tuple) and any(ip.startswith(FAKE_PREFIX) for ip in res[1])
+
+
+          def instances(rule):
+              """Конкретные домены, которые правило ОБЯЗАНО матчить ('*' -> один label)."""
+              if rule.startswith("+."):
+                  base = rule[2:].replace("*", PROBE)
+                  return [base, f"{PROBE}.{base}"]
+              if rule.startswith("."):
+                  return [f"{PROBE}.{rule[1:].replace('*', PROBE)}"]
+              return [rule.replace("*", PROBE)]
+
+
+          def read_lines(path):
+              return [l.strip() for l in Path(path).read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+          kept = read_lines("work/fakeip-filter.list")
+          dropped = {}
+          if Path("work/pruned.txt").exists():
+              for l in read_lines("work/pruned.txt"):
+                  r, _, c = l.partition("\t")
+                  dropped[r] = c
+
+          probes = {}   # домен -> откуда (для диагностики)
+          for r, c in dropped.items():
+              for d in instances(r):
+                  probes.setdefault(d, f"pruned `{r}` (covered by `{c}`)")
+          for r in kept:
+              for d in instances(r):
+                  probes.setdefault(d, f"kept `{r}`")
+          items = list(probes.items())
+          if len(items) > MAX_PROBES:
+              random.Random(1).shuffle(items)
+              items = items[:MAX_PROBES]
+          controls = [f"fakeip-smoke-control-{i}.net-check.xyz" for i in range(3)]
+
+          smoke = Path("work/smoke")
+          smoke.mkdir(parents=True, exist_ok=True)
+          shutil.copy("work/fakeip-filter.mrs", smoke / "fakeip-filter.mrs")
+          (smoke / "config.yaml").write_text(f"""mode: rule
+          log-level: info
+          ipv6: false
           dns:
             enable: true
+            listen: 127.0.0.1:{PORT}
+            ipv6: false
             enhanced-mode: fake-ip
             fake-ip-range: 198.18.0.1/16
             fake-ip-filter:
@@ -293,34 +466,98 @@ jobs:
               path: fakeip-filter.mrs
           rules:
             - MATCH,DIRECT
-          EOF
+          """, encoding="utf-8")
 
-          ./work/mihomo -d work -t -f work/test-config.yaml
-          echo "Mihomo config + MRS load OK"
+          log_path = smoke / "mihomo.log"
+          log = open(log_path, "wb")
+          proc = subprocess.Popen([MIHOMO, "-d", str(smoke), "-f", str(smoke / "config.yaml")],
+                                  stdout=log, stderr=subprocess.STDOUT)
 
-          # [v3] Негативный контроль показал (см. лог): 'mihomo -t' НЕ читает содержимое
-          # MRS, т.е. проверка выше валидирует только конфиг. Контроль убран, вместо него
-          # - реальная проверка содержимого: разворачиваем .mrs обратно в текст самим
-          # mihomo и сверяем количество правил с исходным .list.
-          # Обратная конвертация (convert-ruleset domain mrs ...) есть не во всех версиях,
-          # поэтому если команда не поддерживается - только ::warning::, сборку не валим.
-          # Падаем лишь если развернулось явно меньше (<95%) или пусто.
-          if ./work/mihomo convert-ruleset domain mrs \
-               work/fakeip-filter.mrs work/roundtrip.list >/dev/null 2>&1 \
-             && [ -s work/roundtrip.list ]; then
-            src_count=$(awk 'NF { n++ } END { print n+0 }' work/fakeip-filter.list)
-            rt_count=$(awk 'NF { n++ } END { print n+0 }' work/roundtrip.list)
-            echo "Round-trip: source=$src_count, from MRS=$rt_count"
-            if [ "$rt_count" -lt "$((src_count * 95 / 100))" ]; then
-              echo "::error::MRS содержит заметно меньше правил, чем .list ($rt_count < 95% от $src_count)"
-              exit 1
-            fi
-            echo "Round-trip OK"
-          else
-            echo "::warning::Обратная конвертация MRS -> text недоступна в этой версии mihomo или вернула пустой результат; содержимое MRS не проверено."
-          fi
-          rm -f work/roundtrip.list
 
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+
+          def dump_log():
+              log.flush()
+              print("----- mihomo log (tail) -----")
+              print("\n".join(log_path.read_text(errors="replace").splitlines()[-30:]))
+
+
+          try:
+              # ждём, пока DNS-сервер mihomo поднимется (контрольный домен вне списка -> fake-ip)
+              ready = False
+              for _ in range(60):
+                  if proc.poll() is not None:
+                      dump_log()
+                      fail(f"mihomo завершился при старте (код {proc.returncode}): конфиг или MRS не загрузились")
+                  if is_fake(query(controls[0], timeout=1.0)):
+                      ready = True
+                      break
+                  time.sleep(0.5)
+              if not ready:
+                  dump_log()
+                  fail("mihomo не отвечает на DNS за 30 с (или не отдаёт fake-ip для домена вне списка)")
+
+              blind = [c for c in controls if not is_fake(query(c))]
+              if blind:
+                  dump_log()
+                  fail(f"Тест слепой: контрольные домены вне списка не получили fake-ip: {blind}")
+
+              def run(item):
+                  d, origin = item
+                  res = query(d)
+                  if res is None:                  # один повтор при таймауте
+                      res = query(d, timeout=6.0)
+                  return d, origin, res
+
+              with ThreadPoolExecutor(max_workers=24) as ex:
+                  results = list(ex.map(run, items))
+
+              checked = [r for r in results if r[2] != "skip"]
+              leaked = [(d, o) for d, o, res in checked if is_fake(res)]
+              timeouts = [d for d, o, res in checked if res is None]
+              n_pruned = sum(1 for d, o, res in checked if o.startswith("pruned"))
+              print(f"Probes: {len(checked)} (из выкинутых прунингом: {n_pruned}), "
+                    f"fake-ip утечек: {len(leaked)}, таймаутов: {len(timeouts)}")
+
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a") as f:
+                      f.write("\n### fake-ip smoke test\n\n")
+                      f.write(f"- Probes: {len(checked)} (pruned-covered: {n_pruned})\n")
+                      f.write(f"- Leaks (got fake-ip, must not): **{len(leaked)}**\n")
+                      f.write(f"- Timeouts: {len(timeouts)}\n")
+
+              if leaked:
+                  print("Домены, которые ДОЛЖНЫ быть в фильтре, но получили fake-ip:")
+                  for d, o in leaked[:40]:
+                      print(f"  {d}  <- {o}")
+                  if len(leaked) > 40:
+                      print(f"  ... и ещё {len(leaked) - 40}")
+                  dump_log()
+                  fail(f"{len(leaked)} доменов не попали в fake-ip-filter. Если это домены из pruned - "
+                       f"реальный mihomo матчит маски иначе, чем ожидалось: запусти вручную с no_prune=true")
+              if len(timeouts) > max(5, 0.05 * len(checked)):
+                  fail(f"Слишком много таймаутов DNS ({len(timeouts)} из {len(checked)}): результат ненадёжен")
+              if timeouts:
+                  print(f"::warning::{len(timeouts)} доменов не ответили вовремя (пропущены): {timeouts[:5]}")
+              print("Smoke test OK: все проверенные домены остались в фильтре, контроль вне списка получает fake-ip")
+          finally:
+              proc.terminate()
+              try:
+                  proc.wait(timeout=5)
+              except subprocess.TimeoutExpired:
+                  proc.kill()
+              log.close()
+          PY
+
+      # [v4] Пороги считаем по числу правил ДО прунинга (work/stats.txt): после прунинга
+      # список легитимно короче в разы, и старые проверки (минимум 400, падение -30% к
+      # прошлому списку) срабатывали бы ложно. Прошлое значение хранится в
+      # rules/fakeip-filter.stats; пока файла нет (первый запуск после перехода) -
+      # проверка падения пропускается.
       - name: Check for suspicious rule count drop
         shell: bash
         env:
@@ -328,20 +565,25 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
+          pre=$(tr -d '[:space:]' < work/stats.txt)
           new_count=$(awk 'NF { n++ } END { print n+0 }' work/fakeip-filter.list)
-          echo "New rules: $new_count"
+          echo "Rules before pruning: $pre; after pruning: $new_count"
 
-          # Абсолютный минимум (force его НЕ обходит: защита от пустого/битого списка)
-          if [ "$new_count" -lt 400 ]; then
-            echo "::error::Rule count too low ($new_count < 400)"
+          # Абсолютные минимумы (force их НЕ обходит: защита от пустого/битого списка)
+          if [ "$pre" -lt 400 ]; then
+            echo "::error::Source rule count too low ($pre < 400)"
+            exit 1
+          fi
+          if [ "$new_count" -lt 100 ]; then
+            echo "::error::Final rule count too low ($new_count < 100)"
             exit 1
           fi
 
-          if [ -f rules/fakeip-filter.list ]; then
-            old_count=$(awk 'NF { n++ } END { print n+0 }' rules/fakeip-filter.list)
-            echo "Previous rules: $old_count"
-            if [ "$old_count" -gt 0 ] && [ "$new_count" -lt "$((old_count * 70 / 100))" ]; then
-              echo "=== Diff (removed / added) ==="
+          if [ -f rules/fakeip-filter.stats ]; then
+            old_pre=$(tr -d '[:space:]' < rules/fakeip-filter.stats)
+            echo "Previous rules before pruning: $old_pre"
+            if [ "$old_pre" -gt 0 ] && [ "$pre" -lt "$((old_pre * 70 / 100))" ]; then
+              echo "=== Diff of final lists (removed / added) ==="
               sort rules/fakeip-filter.list > /tmp/old.sorted
               sort work/fakeip-filter.list  > /tmp/new.sorted
               echo "--- Removed ---"
@@ -351,19 +593,19 @@ jobs:
 
               # [#4] обход порога
               if [ "${FORCE:-}" = "true" ]; then
-                echo "::warning::Rule count dropped by more than 30% ($old_count -> $new_count), но force=true - продолжаем"
+                echo "::warning::Source rule count dropped by more than 30% ($old_pre -> $pre), но force=true - продолжаем"
               else
-                echo "::error::Rule count dropped by more than 30% ($old_count -> $new_count). Для обхода запусти вручную с force=true"
+                echo "::error::Source rule count dropped by more than 30% ($old_pre -> $pre). Для обхода запусти вручную с force=true"
                 exit 1
               fi
             fi
+          else
+            echo "::notice::rules/fakeip-filter.stats ещё нет (первый запуск после перехода на [v4]) - проверка падения пропущена"
           fi
 
-      # [ЖЕЛ] Коммитим только если изменился .list (или .mrs ещё не в репо).
-      # Раньше новая версия mihomo могла иначе сериализовать .mrs при том же .list,
-      # что давало лишний коммит и релиз. Побочный эффект: .mrs обновляется
-      # вместе с .list, а не по обновлению mihomo - старые .mrs грузятся новыми
-      # версиями mihomo без проблем.
+      # [ЖЕЛ] Коммитим только если изменился .list (или .mrs / .stats ещё не в репо).
+      # Иначе новая версия mihomo могла иначе сериализовать .mrs при том же .list,
+      # что давало лишний коммит и релиз.
       - name: Publish generated files
         id: publish
         shell: bash
@@ -376,20 +618,24 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add rules/fakeip-filter.list
 
-          if git diff --cached --quiet && git ls-files --error-unmatch rules/fakeip-filter.mrs >/dev/null 2>&1; then
+          if git diff --cached --quiet \
+             && git ls-files --error-unmatch rules/fakeip-filter.mrs >/dev/null 2>&1 \
+             && git ls-files --error-unmatch rules/fakeip-filter.stats >/dev/null 2>&1; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Rules unchanged; no release needed"
             exit 0
           fi
 
           cp work/fakeip-filter.mrs rules/fakeip-filter.mrs
-          git add rules/fakeip-filter.mrs
+          cp work/stats.txt rules/fakeip-filter.stats
+          git add rules/fakeip-filter.mrs rules/fakeip-filter.stats
 
           git commit -m "Update fakeip-filter rules (${{ steps.merge.outputs.final }} rules)" -m "Sources:
           - DustinWin: ${{ steps.merge.outputs.dustin_raw }} → ${{ steps.merge.outputs.dustin_new }} unique
           - wwqgtxx: ${{ steps.merge.outputs.wwqgtxx_raw }} → ${{ steps.merge.outputs.wwqgtxx_new }} unique
           Duplicates: ${{ steps.merge.outputs.duplicates }}
-          Pruned (covered by +.): ${{ steps.merge.outputs.pruned }}"
+          Before pruning: ${{ steps.merge.outputs.pre }}
+          Pruned (covered by masks): ${{ steps.merge.outputs.pruned }}"
 
           git push
           echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -419,7 +665,8 @@ jobs:
             | wwqgtxx | ${{ steps.merge.outputs.wwqgtxx_raw }} | ${{ steps.merge.outputs.wwqgtxx_new }} |
 
             - Duplicates skipped: ${{ steps.merge.outputs.duplicates }}
-            - Pruned (covered by `+.`): ${{ steps.merge.outputs.pruned }}
+            - Before pruning: ${{ steps.merge.outputs.pre }}
+            - Pruned (covered by masks): ${{ steps.merge.outputs.pruned }}
             - **Final rules: ${{ steps.merge.outputs.final }}**
           make_latest: true
           files: |
