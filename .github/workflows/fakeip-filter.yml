@@ -9,6 +9,9 @@
 #   [ЖЕЛ] пункты из «желательно»: токен для API, умный прунинг, коммит только при
 #         изменении .list, timeout, step summary, без кэша mihomo, проверка формата,
 #         очистка старых релизов
+#   [v3]  keepalive: сторонний экшен заблокирован GitHub -> gh api .../enable;
+#         фильтр формата больше не режет строки с пробелом ("mijia cloud");
+#         негативный контроль заменён проверкой MRS -> text (round-trip)
 # =============================================================================
 name: Build fakeip-filter
 
@@ -35,16 +38,32 @@ jobs:
   # ---------------------------------------------------------------------------
   # [#2] Отдельный джоб, чтобы keepalive отработал даже если build упал.
   # Без него GitHub отключит cron-расписание после 60 дней без активности в репо
-  # (а мы коммитим только при изменениях). v2 работает через API, без пустых коммитов.
+  # (а мы коммитим только при изменениях).
+  #
+  # [v3] gautamkrishnar/keepalive-workflow GitHub заблокировал ("Repository access
+  # blocked"), поэтому сторонний экшен убран. Вместо него - один вызов gh API:
+  # PUT .../actions/workflows/<file>/enable (стандартный приём для сброса таймера
+  # 60 дней). Имя файла берём из GITHUB_WORKFLOW_REF, ничего не хардкодим.
   # Если расписание всё же отключилось: Actions -> воркфлоу -> "Enable workflow".
   # ---------------------------------------------------------------------------
   keepalive:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 2
     permissions:
       actions: write
     steps:
-      - uses: gautamkrishnar/keepalive-workflow@v2
+      - name: Re-enable this workflow (reset 60-day inactivity timer)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # owner/repo/.github/workflows/file.yml@refs/heads/main -> file.yml
+          wf="$(basename "${GITHUB_WORKFLOW_REF%%@*}")"
+          echo "Workflow file: $wf"
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/enable"
+          echo "Keepalive OK"
 
   build:
     runs-on: ubuntu-latest
@@ -97,8 +116,11 @@ jobs:
           # [ЖЕЛ] Проверка формата. В fake-ip-filter допустимы маски вида
           # +.a.com, *.a.com, .a.com, time.*.com, поэтому whitelist-regex не
           # используем. Вместо этого ловим признаки ДРУГОГО формата:
-          # пробелы, запятые, двоеточия, кавычки (DOMAIN-SUFFIX,x / YAML payload: / "- 'x'").
-          BAD = re.compile(r"""[\s,:'"/\\#@]""")
+          # запятые, двоеточия, кавычки (DOMAIN-SUFFIX,x / YAML payload: / "- 'x'").
+          # [v3] Пробел из чёрного списка УБРАН: "mijia cloud" - настоящее имя хоста
+          # устройств Xiaomi Mijia (умный дом), оно штатно есть в fake-ip-filter и
+          # должно попадать в итоговый список. Строки с пробелом больше не отбрасываются.
+          BAD = re.compile(r"""[,:'"/\\#@]""")
 
           seen = set()
           merged = []
@@ -276,18 +298,28 @@ jobs:
           ./work/mihomo -d work -t -f work/test-config.yaml
           echo "Mihomo config + MRS load OK"
 
-          # [#1] Негативный контроль: подсовываем битый MRS. Если mihomo -t его
-          # "проглотил", значит тест выше слепой (не читает провайдер) - предупреждаем.
-          # Не фатально, чтобы не блокировать сборку; смотри ::warning:: в логе.
-          mkdir -p work/neg
-          cp work/test-config.yaml work/neg/test-config.yaml
-          head -c 256 /dev/urandom > work/neg/fakeip-filter.mrs
-          if ./work/mihomo -d work/neg -t -f work/neg/test-config.yaml >/dev/null 2>&1; then
-            echo "::warning::Негативный контроль НЕ упал: 'mihomo -t' не проверяет содержимое MRS. Тест загрузки малоинформативен."
+          # [v3] Негативный контроль показал (см. лог): 'mihomo -t' НЕ читает содержимое
+          # MRS, т.е. проверка выше валидирует только конфиг. Контроль убран, вместо него
+          # - реальная проверка содержимого: разворачиваем .mrs обратно в текст самим
+          # mihomo и сверяем количество правил с исходным .list.
+          # Обратная конвертация (convert-ruleset domain mrs ...) есть не во всех версиях,
+          # поэтому если команда не поддерживается - только ::warning::, сборку не валим.
+          # Падаем лишь если развернулось явно меньше (<95%) или пусто.
+          if ./work/mihomo convert-ruleset domain mrs \
+               work/fakeip-filter.mrs work/roundtrip.list >/dev/null 2>&1 \
+             && [ -s work/roundtrip.list ]; then
+            src_count=$(awk 'NF { n++ } END { print n+0 }' work/fakeip-filter.list)
+            rt_count=$(awk 'NF { n++ } END { print n+0 }' work/roundtrip.list)
+            echo "Round-trip: source=$src_count, from MRS=$rt_count"
+            if [ "$rt_count" -lt "$((src_count * 95 / 100))" ]; then
+              echo "::error::MRS содержит заметно меньше правил, чем .list ($rt_count < 95% от $src_count)"
+              exit 1
+            fi
+            echo "Round-trip OK"
           else
-            echo "Negative control OK (битый MRS отвергнут)"
+            echo "::warning::Обратная конвертация MRS -> text недоступна в этой версии mihomo или вернула пустой результат; содержимое MRS не проверено."
           fi
-          rm -rf work/neg
+          rm -f work/roundtrip.list
 
       - name: Check for suspicious rule count drop
         shell: bash
