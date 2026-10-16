@@ -1,6 +1,5 @@
 *
 *.*.xboxlive.com
-*.n.n.srv.nintendo.net
 +.126.net
 +.3gppnetwork.org
 +.ats1.e-timing.ne.jp
@@ -75,7 +74,6 @@
 +.oray.com
 +.orayimg.com
 +.pool.ntp.org
-+.pub.3gppnetwork.org
 +.router.asus.com
 +.s2csntp.miz.nao.ac.jp
 +.sandai.net
@@ -116,10 +114,7 @@ localhost.*.weixin.qq.com
 localhost.ptlogin2.qq.com
 localhost.sec.qq.com
 mesu.apple.com
-Mijia Cloud
 mobileoc.music.tc.qq.com
-music.163.com
-music.migu.cn
 music.taihe.com
 musicapi.taihe.com
 na.b.g-tun.com
@@ -590,4 +585,3 @@ xbox.*.*.microsoft.com
 xbox.*.microsoft.com
 xnotify.xboxlive.com
 xtratime.qcomgeo2.com
-y.qq.com
