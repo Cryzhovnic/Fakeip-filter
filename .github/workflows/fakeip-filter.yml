@@ -14,6 +14,7 @@
 #         smoke-тест на настоящем mihomo (DNS fake-ip) вместо слепого "mihomo -t";
 #         пороги (минимум 400 / падение -30%) считаются ДО прунинга; файл
 #         rules/fakeip-filter.stats хранит это число; input no_prune
+#   [v5]  описание релиза = отчёт из сводки запуска (merge summary + smoke test)
 # =============================================================================
 name: Build fakeip-filter
 
@@ -262,26 +263,29 @@ jobs:
               f.write(f"pruned={pruned}\n")
               f.write(f"final={final}\n")
 
-          # [ЖЕЛ] Сводка на странице запуска
+          # [ЖЕЛ] Сводка на странице запуска. [v5] Тот же markdown сохраняем в файл:
+          # шаг "Compose release notes" кладёт его в описание релиза.
+          rep = "### Merge summary\n\n"
+          rep += "| Source | Valid lines | Unique added | Skipped (bad format) |\n"
+          rep += "|---|---|---|---|\n"
+          for key, label in (("dustin", "DustinWin"), ("wwqgtxx", "wwqgtxx")):
+              rep += f"| {label} | {raw_valid[key]} | {per_source[key]} | {bad_lines[key]} |\n"
+          rep += f"\n- Duplicates skipped: {duplicates}\n"
+          rep += f"- Before pruning: {pre}\n"
+          rep += f"- Pruned (covered by masks): {pruned}\n"
+          rep += f"- **Final rules: {final}**\n"
+          if dropped:
+              by = {}
+              for r, c in dropped.items():
+                  by.setdefault(c, []).append(r)
+              rep += f"\n<details><summary>Pruned rules by covering mask ({len(by)} masks)</summary>\n\n"
+              for c, v in sorted(by.items(), key=lambda x: -len(x[1])):
+                  rep += (f"- `{c}` covers {len(v)}: " + ", ".join(f"`{x}`" for x in sorted(v)[:8])
+                          + (" ..." if len(v) > 8 else "") + "\n")
+              rep += "\n</details>\n"
+          Path("work/report_merge.md").write_text(rep, encoding="utf-8")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("### Merge summary\n\n")
-              f.write("| Source | Valid lines | Unique added | Skipped (bad format) |\n")
-              f.write("|---|---|---|---|\n")
-              for key, label in (("dustin", "DustinWin"), ("wwqgtxx", "wwqgtxx")):
-                  f.write(f"| {label} | {raw_valid[key]} | {per_source[key]} | {bad_lines[key]} |\n")
-              f.write(f"\n- Duplicates skipped: {duplicates}\n")
-              f.write(f"- Before pruning: {pre}\n")
-              f.write(f"- Pruned (covered by masks): {pruned}\n")
-              f.write(f"- **Final rules: {final}**\n")
-              if dropped:
-                  by = {}
-                  for r, c in dropped.items():
-                      by.setdefault(c, []).append(r)
-                  f.write(f"\n<details><summary>Pruned rules by covering mask ({len(by)} masks)</summary>\n\n")
-                  for c, v in sorted(by.items(), key=lambda x: -len(x[1])):
-                      f.write(f"- `{c}` covers {len(v)}: " + ", ".join(f"`{x}`" for x in sorted(v)[:8])
-                              + (" ..." if len(v) > 8 else "") + "\n")
-                  f.write("\n</details>\n")
+              f.write(rep)
           PY
 
       # [ЖЕЛ] Кэш mihomo убран: бинарник маленький, скачивается за секунды.
@@ -522,13 +526,14 @@ jobs:
               print(f"Probes: {len(checked)} (из выкинутых прунингом: {n_pruned}), "
                     f"fake-ip утечек: {len(leaked)}, таймаутов: {len(timeouts)}")
 
+              rep = "### fake-ip smoke test\n\n"
+              rep += f"- Probes: {len(checked)} (pruned-covered: {n_pruned})\n"
+              rep += f"- Leaks (got fake-ip, must not): **{len(leaked)}**\n"
+              rep += f"- Timeouts: {len(timeouts)}\n"
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
               if summary:
                   with open(summary, "a") as f:
-                      f.write("\n### fake-ip smoke test\n\n")
-                      f.write(f"- Probes: {len(checked)} (pruned-covered: {n_pruned})\n")
-                      f.write(f"- Leaks (got fake-ip, must not): **{len(leaked)}**\n")
-                      f.write(f"- Timeouts: {len(timeouts)}\n")
+                      f.write("\n" + rep)
 
               if leaked:
                   print("Домены, которые ДОЛЖНЫ быть в фильтре, но получили fake-ip:")
@@ -543,6 +548,7 @@ jobs:
                   fail(f"Слишком много таймаутов DNS ({len(timeouts)} из {len(checked)}): результат ненадёжен")
               if timeouts:
                   print(f"::warning::{len(timeouts)} доменов не ответили вовремя (пропущены): {timeouts[:5]}")
+              Path("work/report_smoke.md").write_text(rep, encoding="utf-8")   # [v5] для описания релиза
               print("Smoke test OK: все проверенные домены остались в фильтре, контроль вне списка получает fake-ip")
           finally:
               proc.terminate()
@@ -648,6 +654,26 @@ jobs:
           echo "tag=fakeip-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
           echo "title=fakeip-filter $(date -u +'%Y-%m-%d %H:%M UTC') (${{ steps.merge.outputs.final }} rules)" >> "$GITHUB_OUTPUT"
 
+      # [v5] Описание релиза = тот же отчёт, что и в сводке запуска (Merge summary со
+      # сворачиваемым списком прунинга + fake-ip smoke test). Скрипты выше пишут его в
+      # work/report_*.md, здесь он собирается в один файл.
+      - name: Compose release notes
+        if: steps.publish.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Automated merge of fakeip-filter sources."
+            echo
+            echo "- Built with: $(./work/mihomo -v | head -1)"
+            echo "- Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            cat work/report_merge.md
+            echo
+            cat work/report_smoke.md
+          } > work/release_notes.md
+          cat work/release_notes.md
+
       # Для сторонних экшенов можно закрепить коммит по SHA вместо тега
       # (softprops/action-gh-release@<sha> # v3) - защита от подмены тега.
       - name: Create release
@@ -656,18 +682,7 @@ jobs:
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.title }}
-          body: |
-            Automated merge of fakeip-filter sources.
-
-            | Source | Valid lines | Unique added |
-            |--------|-------------|--------------|
-            | DustinWin | ${{ steps.merge.outputs.dustin_raw }} | ${{ steps.merge.outputs.dustin_new }} |
-            | wwqgtxx | ${{ steps.merge.outputs.wwqgtxx_raw }} | ${{ steps.merge.outputs.wwqgtxx_new }} |
-
-            - Duplicates skipped: ${{ steps.merge.outputs.duplicates }}
-            - Before pruning: ${{ steps.merge.outputs.pre }}
-            - Pruned (covered by masks): ${{ steps.merge.outputs.pruned }}
-            - **Final rules: ${{ steps.merge.outputs.final }}**
+          body_path: work/release_notes.md
           make_latest: true
           files: |
             work/fakeip-filter.mrs
