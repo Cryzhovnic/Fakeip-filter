@@ -40,7 +40,7 @@ dns:
 
 Другие варианты ссылки:
 
-- из репозитория: `https://raw.githubusercontent.com/Cryzhovnic/Fakeip-filter/main/rules/fakeip-filter.mrs` (если основная ветка у тебя называется иначе, замени `main`);
+- из репозитория: `https://raw.githubusercontent.com/Cryzhovnic/Fakeip-filter/main/rules/fakeip-filter.mrs` 
 - текстовый список: то же самое, но `fakeip-filter.list` и `format: text`.
 
 > Важно: по умолчанию `fake-ip-filter-mode` равен `blacklist`, и домены из списка получают реальный IP. Если ты включил режим `whitelist`, смысл списка инвертируется: домены из него, наоборот, получат fake-ip.
